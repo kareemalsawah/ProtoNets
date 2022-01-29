@@ -1,0 +1,5 @@
+omniglot_resized/*
+.ipynb_checkpoints/*
+Debugging.ipynb
+__pycache__/*
+maml.py
