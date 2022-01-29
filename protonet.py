@@ -20,11 +20,11 @@ KERNEL_SIZE = 3
 NUM_CONV_LAYERS = 4
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 SUMMARY_INTERVAL = 10
-SAVE_INTERVAL = 100
+SAVE_INTERVAL = 500
 PRINT_INTERVAL = 10
 VAL_INTERVAL = PRINT_INTERVAL * 5
 NUM_TEST_TASKS = 600
-
+print('Using device: ',DEVICE)
 
 class ProtoNetNetwork(nn.Module):
     """Container for ProtoNet weights and image-to-latent computation."""
@@ -79,7 +79,7 @@ class ProtoNetNetwork(nn.Module):
 class ProtoNet:
     """Trains and assesses a prototypical network."""
 
-    def __init__(self, learning_rate, tensorboard_writer=None, neptune_run=None):
+    def __init__(self, learning_rate, log_dir, tensorboard_writer=None, neptune_run=None):
         """Inits ProtoNet.
 
         Args:
@@ -92,9 +92,9 @@ class ProtoNet:
             self._network.parameters(),
             lr=learning_rate
         )
-        self.writer = tensorboard_writer
-            
+        self._log_dir = log_dir
 
+        self.writer = tensorboard_writer
         self.neptune_run = neptune_run
 
         self._start_train_step = 0
@@ -126,25 +126,32 @@ class ProtoNet:
             batch_size_support = images_support.shape[0]
             batch_size_query = images_query.shape[0]
             n_classes = torch.max(labels_support)+1
+            n_shots = torch.div(batch_size_support,n_classes, rounding_mode='trunc')
 
             # Support and query encodings
-            encodings_support = self._network(images_support).reshape(batch_size_support, 1, enc_size)
-            encodings_query = self._network(images_query).reshape(batch_size_query, 1, enc_size)
+            encodings_support = self._network(images_support).reshape(batch_size_support, 1, -1)
+            encodings_query = self._network(images_query).reshape(batch_size_query, 1, -1)
+            # encodings_support = images_support.reshape(batch_size_support, 1, 784)
+            # encodings_query = images_query.reshape(batch_size_query, 1, 784)
             enc_size = encodings_support.shape[-1]
 
             # Compute Prototypes
-            indices = torch.argsort(labels_support).reshape(-1,labels_support.shape[0]//n_classes)
-            im = images_support[indices]
-            prototypes =  torch.mean(im,dim=1).reshape(1,n_classes,-1)  # shape = (n_classes, enc_size)
+            indices = torch.argsort(labels_support).reshape(n_classes,n_shots)
+            im = encodings_support.reshape(batch_size_support,enc_size)[indices]
+            prototypes =  torch.mean(im,dim=1).reshape(1,n_classes,enc_size)
 
             # Compute distances to prototypes
             distances_query = torch.linalg.norm(prototypes-encodings_query, dim=-1)  # shape = (batch_size_query, n_classes)
             distances_support = torch.linalg.norm(prototypes-encodings_support, dim=-1)  # shape = (batch_size_support, n_classes)
 
+            # Compute logits
+            logits_query = -1*distances_query**2
+            logits_support = -1*distances_support**2
+
             # Compute loss and accuracies
-            single_batch_loss = F.cross_entropy(distances_query, labels_query)
-            single_batch_support_acc = util.score(distances_support.detach(), labels_support)
-            single_batch_query_acc = util.score(distances_query.detach(), labels_query)
+            single_batch_loss = F.cross_entropy(logits_query, labels_query)
+            single_batch_support_acc = util.score(logits_support.detach(), labels_support)
+            single_batch_query_acc = util.score(logits_query.detach(), labels_query)
 
             # Populate values of loss and accuracies
             loss_batch.append(single_batch_loss)
@@ -228,6 +235,8 @@ class ProtoNet:
 
             if i_step % SAVE_INTERVAL == 0:
                 self._save(i_step)
+      
+        self._save('final save')
 
     def test(self, dataloader_test):
         """Evaluate the ProtoNet on test tasks.
@@ -292,20 +301,19 @@ class ProtoNet:
 def main(args):
     tensorboard_writer = None
     neptune_run = None
-
+    log_dir = args.log_dir
+    if log_dir is None:
+        log_dir = f'./logs/protonet/omniglot.way:{args.num_way}.support:{args.num_support}.query:{args.num_query}.lr:{args.learning_rate}.batch_size:{args.batch_size}'  # pylint: disable=line-too-long
+    print(f'log_dir: {log_dir}')
+    os.makedirs(log_dir, exist_ok=True)
     if args.tensorboard:
-        log_dir = args.log_dir
-        if log_dir is None:
-            log_dir = f'./logs/protonet/omniglot.way:{args.num_way}.support:{args.num_support}.query:{args.num_query}.lr:{args.learning_rate}.batch_size:{args.batch_size}'  # pylint: disable=line-too-long
-        print(f'log_dir: {log_dir}')
-        os.makedirs(log_dir, exist_ok=True)
         tensorboard_writer = tensorboard.SummaryWriter(log_dir=log_dir)
     
     if args.neptune:
         api_token = ''
         neptune_run = neptune.init(project='kareem-elsawah/meta-learning', api_token=api_token, source_files=["*.py"])
     
-    protonet = ProtoNet(args.learning_rate, tensorboard_writer=tensorboard_writer, neptune_run=neptune_run)
+    protonet = ProtoNet(args.learning_rate, log_dir, tensorboard_writer=tensorboard_writer, neptune_run=neptune_run)
     
     if args.checkpoint_step > -1:
         protonet.load(args.checkpoint_step)
@@ -383,7 +391,7 @@ if __name__ == '__main__':
                         help='learning rate for the network')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='number of tasks per outer-loop update')
-    parser.add_argument('--num_train_iterations', type=int, default=15000,
+    parser.add_argument('--num_train_iterations', type=int, default=3000,
                         help='number of outer-loop updates to train for')
     parser.add_argument('--test', default=False, action='store_true',
                         help='train-and-test or only-test')
